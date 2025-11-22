@@ -3,6 +3,7 @@
 #include "../Screen.h"
 #include "DebugRenderer.h"
 #include "FSCommon.h"
+#include "MeshService.h"
 #include "NodeDB.h"
 #include "Throttle.h"
 #include "UIRenderer.h"
@@ -10,6 +11,7 @@
 #include "gps/RTC.h"
 #include "graphics/ScreenFonts.h"
 #include "graphics/SharedUIDisplay.h"
+#include "graphics/TimeFormatters.h"
 #include "graphics/images.h"
 #include "main.h"
 #include "mesh/Channels.h"
@@ -223,6 +225,8 @@ void drawFrameWiFi(OLEDDisplay *display, OLEDDisplayUiState *state, int16_t x, i
 
     display->drawString(x, getTextPositions(display)[line++], "URL: http://meshtastic.local");
 
+    graphics::drawCommonFooter(display, x, y);
+
     /* Display a heartbeat pixel that blinks every time the frame is redrawn */
 #ifdef SHOW_REDRAWS
     if (heartbeat)
@@ -277,12 +281,13 @@ void drawFrameSettings(OLEDDisplay *display, OLEDDisplayUiState *state, int16_t 
     std::string uptime = UIRenderer::drawTimeDelta(days, hours, minutes, seconds);
 
     // Line 1 (Still)
+#if !defined(M5STACK_UNITC6L)
     display->drawString(x + SCREEN_WIDTH - display->getStringWidth(uptime.c_str()), y, uptime.c_str());
     if (config.display.heading_bold)
         display->drawString(x - 1 + SCREEN_WIDTH - display->getStringWidth(uptime.c_str()), y, uptime.c_str());
 
     display->setColor(WHITE);
-
+#endif
     // Setup string to assemble analogClock string
     std::string analogClock = "";
 
@@ -329,8 +334,7 @@ void drawFrameSettings(OLEDDisplay *display, OLEDDisplayUiState *state, int16_t 
 #if HAS_GPS
     if (config.position.gps_mode == meshtastic_Config_PositionConfig_GpsMode_ENABLED) {
         // Line 3
-        if (config.display.gps_format !=
-            meshtastic_Config_DisplayConfig_GpsCoordinateFormat_DMS) // if DMS then don't draw altitude
+        if (uiconfig.gps_format != meshtastic_DeviceUIConfig_GpsCoordinateFormat_DMS) // if DMS then don't draw altitude
             UIRenderer::drawGpsAltitude(display, x, y + FONT_HEIGHT_SMALL * 2, gpsStatus);
 
         // Line 4
@@ -386,7 +390,11 @@ void drawLoRaFocused(OLEDDisplay *display, OLEDDisplayUiState *state, int16_t x,
     char shortnameble[35];
     getMacAddr(dmac);
     snprintf(screen->ourId, sizeof(screen->ourId), "%02x%02x", dmac[4], dmac[5]);
+#if defined(M5STACK_UNITC6L)
+    snprintf(shortnameble, sizeof(shortnameble), "%s", screen->ourId);
+#else
     snprintf(shortnameble, sizeof(shortnameble), "BLE: %s", screen->ourId);
+#endif
     int textWidth = display->getStringWidth(shortnameble);
     int nameX = (SCREEN_WIDTH - textWidth);
     display->drawString(nameX, getTextPositions(display)[line++], shortnameble);
@@ -405,7 +413,11 @@ void drawLoRaFocused(OLEDDisplay *display, OLEDDisplayUiState *state, int16_t x,
     char regionradiopreset[25];
     const char *region = myRegion ? myRegion->name : NULL;
     if (region != nullptr) {
-        snprintf(regionradiopreset, sizeof(regionradiopreset), "Reg: %s/%s", region, mode);
+#if defined(M5STACK_UNITC6L)
+        snprintf(regionradiopreset, sizeof(regionradiopreset), "%s", region);
+#else
+        snprintf(regionradiopreset, sizeof(regionradiopreset), "%s/%s", region, mode);
+#endif
     }
     textWidth = display->getStringWidth(regionradiopreset);
     nameX = (SCREEN_WIDTH - textWidth) / 2;
@@ -417,9 +429,17 @@ void drawLoRaFocused(OLEDDisplay *display, OLEDDisplayUiState *state, int16_t x,
     float freq = RadioLibInterface::instance->getFreq();
     snprintf(freqStr, sizeof(freqStr), "%.3f", freq);
     if (config.lora.channel_num == 0) {
+#if defined(M5STACK_UNITC6L)
+        snprintf(frequencyslot, sizeof(frequencyslot), "%sMHz", freqStr);
+#else
         snprintf(frequencyslot, sizeof(frequencyslot), "Freq: %sMHz", freqStr);
+#endif
     } else {
+#if defined(M5STACK_UNITC6L)
+        snprintf(frequencyslot, sizeof(frequencyslot), "%sMHz (%d)", freqStr, config.lora.channel_num);
+#else
         snprintf(frequencyslot, sizeof(frequencyslot), "Freq/Ch: %sMHz (%d)", freqStr, config.lora.channel_num);
+#endif
     }
     size_t len = strlen(frequencyslot);
     if (len >= 4 && strcmp(frequencyslot + len - 4, " (0)") == 0) {
@@ -429,6 +449,7 @@ void drawLoRaFocused(OLEDDisplay *display, OLEDDisplayUiState *state, int16_t x,
     nameX = (SCREEN_WIDTH - textWidth) / 2;
     display->drawString(nameX, getTextPositions(display)[line++], frequencyslot);
 
+#if !defined(M5STACK_UNITC6L)
     // === Fifth Row: Channel Utilization ===
     const char *chUtil = "ChUtil:";
     char chUtilPercentage[10];
@@ -485,6 +506,8 @@ void drawLoRaFocused(OLEDDisplay *display, OLEDDisplayUiState *state, int16_t x,
 
     display->drawString(starting_position + chUtil_x + chutil_bar_width + extraoffset, getTextPositions(display)[line++],
                         chUtilPercentage);
+#endif
+    graphics::drawCommonFooter(display, x, y);
 }
 
 // ****************************
@@ -510,8 +533,11 @@ void drawSystemScreen(OLEDDisplay *display, OLEDDisplayUiState *state, int16_t x
 #ifdef USE_EINK
     barsOffset -= 12;
 #endif
+#if defined(M5STACK_UNITC6L)
+    const int barX = x + 45 + barsOffset;
+#else
     const int barX = x + 40 + barsOffset;
-
+#endif
     auto drawUsageRow = [&](const char *label, uint32_t used, uint32_t total, bool isHeap = false) {
         if (total == 0)
             return;
@@ -536,7 +562,7 @@ void drawSystemScreen(OLEDDisplay *display, OLEDDisplayUiState *state, int16_t x
         // Label
         display->setTextAlignment(TEXT_ALIGN_LEFT);
         display->drawString(labelX, getTextPositions(display)[line], label);
-
+#if !defined(M5STACK_UNITC6L)
         // Bar
         int barY = getTextPositions(display)[line] + (FONT_HEIGHT_SMALL - barHeight) / 2;
         display->setColor(WHITE);
@@ -544,7 +570,7 @@ void drawSystemScreen(OLEDDisplay *display, OLEDDisplayUiState *state, int16_t x
 
         display->fillRect(barX, barY, fillWidth, barHeight);
         display->setColor(WHITE);
-
+#endif
         // Value string
         display->setTextAlignment(TEXT_ALIGN_RIGHT);
         display->drawString(SCREEN_WIDTH - 2, getTextPositions(display)[line], combinedStr);
@@ -597,10 +623,16 @@ void drawSystemScreen(OLEDDisplay *display, OLEDDisplayUiState *state, int16_t x
         line += 1;
     }
     line += 1;
+
     char appversionstr[35];
     snprintf(appversionstr, sizeof(appversionstr), "Ver: %s", optstr(APP_VERSION));
     char appversionstr_formatted[40];
     char *lastDot = strrchr(appversionstr, '.');
+#if defined(M5STACK_UNITC6L)
+    if (lastDot != nullptr) {
+        *lastDot = '\0'; // truncate string
+    }
+#else
     if (lastDot) {
         size_t prefixLen = lastDot - appversionstr;
         strncpy(appversionstr_formatted, appversionstr, prefixLen);
@@ -611,28 +643,52 @@ void drawSystemScreen(OLEDDisplay *display, OLEDDisplayUiState *state, int16_t x
         strncpy(appversionstr, appversionstr_formatted, sizeof(appversionstr) - 1);
         appversionstr[sizeof(appversionstr) - 1] = '\0';
     }
+#endif
     int textWidth = display->getStringWidth(appversionstr);
     int nameX = (SCREEN_WIDTH - textWidth) / 2;
-    display->drawString(nameX, getTextPositions(display)[line], appversionstr);
 
-    if (SCREEN_HEIGHT > 64 || (SCREEN_HEIGHT <= 64 && line < 4)) { // Only show uptime if the screen can show it
-        line += 1;
+    display->drawString(nameX, getTextPositions(display)[line++], appversionstr);
+
+    if (SCREEN_HEIGHT > 64 || (SCREEN_HEIGHT <= 64 && line <= 5)) { // Only show uptime if the screen can show it
         char uptimeStr[32] = "";
-        uint32_t uptime = millis() / 1000;
-        uint32_t days = uptime / 86400;
-        uint32_t hours = (uptime % 86400) / 3600;
-        uint32_t mins = (uptime % 3600) / 60;
-        // Show as "Up: 2d 3h", "Up: 5h 14m", or "Up: 37m"
-        if (days)
-            snprintf(uptimeStr, sizeof(uptimeStr), " Up: %ud %uh", days, hours);
-        else if (hours)
-            snprintf(uptimeStr, sizeof(uptimeStr), " Up: %uh %um", hours, mins);
-        else
-            snprintf(uptimeStr, sizeof(uptimeStr), " Uptime: %um", mins);
+        getUptimeStr(millis(), "Up", uptimeStr, sizeof(uptimeStr));
         textWidth = display->getStringWidth(uptimeStr);
         nameX = (SCREEN_WIDTH - textWidth) / 2;
-        display->drawString(nameX, getTextPositions(display)[line], uptimeStr);
+        display->drawString(nameX, getTextPositions(display)[line++], uptimeStr);
     }
+
+    if (SCREEN_HEIGHT > 64 || (SCREEN_HEIGHT <= 64 && line <= 5)) { // Only show API state if the screen can show it
+        char api_state[32] = "";
+        const char *clientWord = nullptr;
+
+        // Determine if narrow or wide screen
+        if (isHighResolution) {
+            clientWord = "Client";
+        } else {
+            clientWord = "App";
+        }
+        snprintf(api_state, sizeof(api_state), "No %ss Connected", clientWord);
+
+        if (service->api_state == service->STATE_BLE) {
+            snprintf(api_state, sizeof(api_state), "%s Connected (BLE)", clientWord);
+        } else if (service->api_state == service->STATE_WIFI) {
+            snprintf(api_state, sizeof(api_state), "%s Connected (WiFi)", clientWord);
+        } else if (service->api_state == service->STATE_SERIAL) {
+            snprintf(api_state, sizeof(api_state), "%s Connected (Serial)", clientWord);
+        } else if (service->api_state == service->STATE_PACKET) {
+            snprintf(api_state, sizeof(api_state), "%s Connected (Internal)", clientWord);
+        } else if (service->api_state == service->STATE_HTTP) {
+            snprintf(api_state, sizeof(api_state), "%s Connected (HTTP)", clientWord);
+        } else if (service->api_state == service->STATE_ETH) {
+            snprintf(api_state, sizeof(api_state), "%s Connected (Ethernet)", clientWord);
+        }
+        if (api_state[0] != '\0') {
+            display->drawString((SCREEN_WIDTH - display->getStringWidth(api_state)) / 2, getTextPositions(display)[line++],
+                                api_state);
+        }
+    }
+
+    graphics::drawCommonFooter(display, x, y);
 }
 
 // ****************************
@@ -661,6 +717,7 @@ void drawChirpy(OLEDDisplay *display, OLEDDisplayUiState *state, int16_t x, int1
     textX = (display->getWidth() / 2) - textX_offset - (display->getStringWidth("World!") / 2);
     display->drawString(textX, getTextPositions(display)[line++], "World!");
 }
+
 } // namespace DebugRenderer
 } // namespace graphics
 #endif

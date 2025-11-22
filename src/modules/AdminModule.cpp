@@ -104,6 +104,19 @@ bool AdminModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp, meshta
             (config.security.admin_key[2].size == 32 &&
              memcmp(mp.public_key.bytes, config.security.admin_key[2].bytes, 32) == 0)) {
             LOG_INFO("PKC admin payload with authorized sender key");
+
+            // Automatically favorite the node that is using the admin key
+            auto remoteNode = nodeDB->getMeshNode(mp.from);
+            if (remoteNode && !remoteNode->is_favorite) {
+                if (config.device.role == meshtastic_Config_DeviceConfig_Role_CLIENT_BASE) {
+                    // Special case for CLIENT_BASE: is_favorite has special meaning, and we don't want to automatically set it
+                    // without the user doing so deliberately.
+                    LOG_INFO("PKC admin valid, but not auto-favoriting node %x because role==CLIENT_BASE", mp.from);
+                } else {
+                    LOG_INFO("PKC admin valid. Auto-favoriting node %x", mp.from);
+                    remoteNode->is_favorite = true;
+                }
+            }
         } else {
             myReply = allocErrorResponse(meshtastic_Routing_Error_ADMIN_PUBLIC_KEY_UNAUTHORIZED, &mp);
             LOG_INFO("Received PKC admin payload, but the sender public key does not match the admin authorized key!");
@@ -276,7 +289,12 @@ bool AdminModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp, meshta
     case meshtastic_AdminMessage_nodedb_reset_tag: {
         disableBluetooth();
         LOG_INFO("Initiate node-db reset");
-        nodeDB->resetNodes();
+        //  CLIENT_BASE, ROUTER and ROUTER_LATE are able to preserve the remaining hop count when relaying a packet via a
+        //  favorited node, so ensure that their favorites are kept on reset
+        bool rolePreference =
+            isOneOf(config.device.role, meshtastic_Config_DeviceConfig_Role_CLIENT_BASE,
+                    meshtastic_Config_DeviceConfig_Role_ROUTER, meshtastic_Config_DeviceConfig_Role_ROUTER_LATE);
+        nodeDB->resetNodes(rolePreference ? rolePreference : r->nodedb_reset);
         reboot(DEFAULT_REBOOT_SECONDS);
         break;
     }
@@ -550,10 +568,8 @@ void AdminModule::handleSetOwner(const meshtastic_User &o)
         changed |= strcmp(owner.short_name, o.short_name);
         strncpy(owner.short_name, o.short_name, sizeof(owner.short_name));
     }
-    if (*o.id) {
-        changed |= strcmp(owner.id, o.id);
-        strncpy(owner.id, o.id, sizeof(owner.id));
-    }
+    snprintf(owner.id, sizeof(owner.id), "!%08x", nodeDB->getNodeNum());
+
     if (owner.is_licensed != o.is_licensed) {
         changed = 1;
         owner.is_licensed = o.is_licensed;
@@ -607,10 +623,9 @@ void AdminModule::handleSetConfig(const meshtastic_Config &c)
         }
         config.device = c.payload_variant.device;
         if (config.device.rebroadcast_mode == meshtastic_Config_DeviceConfig_RebroadcastMode_NONE &&
-            IS_ONE_OF(config.device.role, meshtastic_Config_DeviceConfig_Role_ROUTER,
-                      meshtastic_Config_DeviceConfig_Role_REPEATER)) {
+            config.device.role == meshtastic_Config_DeviceConfig_Role_ROUTER) {
             config.device.rebroadcast_mode = meshtastic_Config_DeviceConfig_RebroadcastMode_ALL;
-            const char *warning = "Rebroadcast mode can't be set to NONE for a router or repeater";
+            const char *warning = "Rebroadcast mode can't be set to NONE for a router";
             LOG_WARN(warning);
             sendWarning(warning);
         }
@@ -623,8 +638,9 @@ void AdminModule::handleSetConfig(const meshtastic_Config &c)
             LOG_DEBUG("Tried to set node_info_broadcast_secs too low, setting to %d", min_node_info_broadcast_secs);
             config.device.node_info_broadcast_secs = min_node_info_broadcast_secs;
         }
-        // Router Client is deprecated; Set it to client
-        if (c.payload_variant.device.role == meshtastic_Config_DeviceConfig_Role_ROUTER_CLIENT) {
+        // Router Client and Repeater deprecated; Set it to client
+        if (IS_ONE_OF(c.payload_variant.device.role, meshtastic_Config_DeviceConfig_Role_ROUTER_CLIENT,
+                      meshtastic_Config_DeviceConfig_Role_REPEATER)) {
             config.device.role = meshtastic_Config_DeviceConfig_Role_CLIENT;
             if (moduleConfig.store_forward.enabled && !moduleConfig.store_forward.is_server) {
                 moduleConfig.store_forward.is_server = true;
@@ -633,10 +649,9 @@ void AdminModule::handleSetConfig(const meshtastic_Config &c)
             }
         }
 #if USERPREFS_EVENT_MODE
-        // If we're in event mode, nobody is a Router or Repeater
+        // If we're in event mode, nobody is a Router or Router Late
         if (config.device.role == meshtastic_Config_DeviceConfig_Role_ROUTER ||
-            config.device.role == meshtastic_Config_DeviceConfig_Role_ROUTER_LATE ||
-            config.device.role == meshtastic_Config_DeviceConfig_Role_REPEATER) {
+            config.device.role == meshtastic_Config_DeviceConfig_Role_ROUTER_LATE) {
             config.device.role = meshtastic_Config_DeviceConfig_Role_CLIENT;
         }
 #endif
@@ -703,20 +718,40 @@ void AdminModule::handleSetConfig(const meshtastic_Config &c)
 #endif
         config.display = c.payload_variant.display;
         break;
-    case meshtastic_Config_lora_tag:
+
+    case meshtastic_Config_lora_tag: {
+        // Wrap the entire case in a block to scope variables and avoid crossing initialization
+        auto oldLoraConfig = config.lora;
+        auto validatedLora = c.payload_variant.lora;
+
         LOG_INFO("Set config: LoRa");
         config.has_lora = true;
+
+        if (validatedLora.coding_rate < 4 || validatedLora.coding_rate > 8) {
+            LOG_WARN("Invalid coding_rate %d, setting to 5", validatedLora.coding_rate);
+            validatedLora.coding_rate = 5;
+        }
+
+        if (validatedLora.spread_factor < 7 || validatedLora.spread_factor > 12) {
+            LOG_WARN("Invalid spread_factor %d, setting to 11", validatedLora.spread_factor);
+            validatedLora.spread_factor = 11;
+        }
+
+        if (validatedLora.bandwidth == 0) {
+            int originalBandwidth = validatedLora.bandwidth;
+            validatedLora.bandwidth = myRegion->wideLora ? 800 : 250;
+            LOG_WARN("Invalid bandwidth %d, setting to default", originalBandwidth);
+        }
+
         // If no lora radio parameters change, don't need to reboot
-        if (config.lora.use_preset == c.payload_variant.lora.use_preset && config.lora.region == c.payload_variant.lora.region &&
-            config.lora.modem_preset == c.payload_variant.lora.modem_preset &&
-            config.lora.bandwidth == c.payload_variant.lora.bandwidth &&
-            config.lora.spread_factor == c.payload_variant.lora.spread_factor &&
-            config.lora.coding_rate == c.payload_variant.lora.coding_rate &&
-            config.lora.tx_power == c.payload_variant.lora.tx_power &&
-            config.lora.frequency_offset == c.payload_variant.lora.frequency_offset &&
-            config.lora.override_frequency == c.payload_variant.lora.override_frequency &&
-            config.lora.channel_num == c.payload_variant.lora.channel_num &&
-            config.lora.sx126x_rx_boosted_gain == c.payload_variant.lora.sx126x_rx_boosted_gain) {
+        if (oldLoraConfig.use_preset == validatedLora.use_preset && oldLoraConfig.region == validatedLora.region &&
+            oldLoraConfig.modem_preset == validatedLora.modem_preset && oldLoraConfig.bandwidth == validatedLora.bandwidth &&
+            oldLoraConfig.spread_factor == validatedLora.spread_factor &&
+            oldLoraConfig.coding_rate == validatedLora.coding_rate && oldLoraConfig.tx_power == validatedLora.tx_power &&
+            oldLoraConfig.frequency_offset == validatedLora.frequency_offset &&
+            oldLoraConfig.override_frequency == validatedLora.override_frequency &&
+            oldLoraConfig.channel_num == validatedLora.channel_num &&
+            oldLoraConfig.sx126x_rx_boosted_gain == validatedLora.sx126x_rx_boosted_gain) {
             requiresReboot = false;
         }
 
@@ -735,9 +770,10 @@ void AdminModule::handleSetConfig(const meshtastic_Config &c)
             digitalWrite(RF95_FAN_EN, HIGH ^ 0);
         }
 #endif
-        config.lora = c.payload_variant.lora;
+        config.lora = validatedLora;
         // If we're setting region for the first time, init the region and regenerate the keys
         if (isRegionUnset && config.lora.region > meshtastic_Config_LoRaConfig_RegionCode_UNSET) {
+#if !(MESHTASTIC_EXCLUDE_PKI_KEYGEN || MESHTASTIC_EXCLUDE_PKI)
             if (!owner.is_licensed) {
                 bool keygenSuccess = false;
                 if (config.security.private_key.size == 32) {
@@ -756,17 +792,32 @@ void AdminModule::handleSetConfig(const meshtastic_Config &c)
                     memcpy(owner.public_key.bytes, config.security.public_key.bytes, 32);
                 }
             }
+#endif
             config.lora.tx_enabled = true;
             initRegion();
             if (myRegion->dutyCycle < 100) {
                 config.lora.ignore_mqtt = true; // Ignore MQTT by default if region has a duty cycle limit
             }
+            //  Compare the entire string, we are sure of the length as a topic has never been set
             if (strcmp(moduleConfig.mqtt.root, default_mqtt_root) == 0) {
                 sprintf(moduleConfig.mqtt.root, "%s/%s", default_mqtt_root, myRegion->name);
                 changes = SEGMENT_CONFIG | SEGMENT_MODULECONFIG;
             }
         }
+        if (config.lora.region != myRegion->code) {
+            //  Region has changed so check whether there is a regulatory one we should be using instead.
+            //  Additionally as a side-effect, assume a new value under myRegion
+            initRegion();
+
+            if (strncmp(moduleConfig.mqtt.root, default_mqtt_root, strlen(default_mqtt_root)) == 0) {
+                //  Default root is in use, so subscribe to the appropriate MQTT topic for this region
+                sprintf(moduleConfig.mqtt.root, "%s/%s", default_mqtt_root, myRegion->name);
+            }
+
+            changes = SEGMENT_CONFIG | SEGMENT_MODULECONFIG;
+        }
         break;
+    }
     case meshtastic_Config_bluetooth_tag:
         LOG_INFO("Set config: Bluetooth");
         config.has_bluetooth = true;
@@ -1040,32 +1091,19 @@ void AdminModule::handleGetModuleConfig(const meshtastic_MeshPacket &req, const 
             res.get_module_config_response.payload_variant.serial = moduleConfig.serial;
             break;
         case meshtastic_AdminMessage_ModuleConfigType_EXTNOTIF_CONFIG:
-#if !MESHTASTIC_EXCLUDE_EXTERNALNOTIFICATION
             LOG_INFO("Get module config: External Notification");
             res.get_module_config_response.which_payload_variant = meshtastic_ModuleConfig_external_notification_tag;
             res.get_module_config_response.payload_variant.external_notification = moduleConfig.external_notification;
-#else
-            LOG_DEBUG("External Notification module excluded from build, skipping config");
-#endif
             break;
         case meshtastic_AdminMessage_ModuleConfigType_STOREFORWARD_CONFIG:
-#if !MESHTASTIC_EXCLUDE_STOREFORWARD
             LOG_INFO("Get module config: Store & Forward");
             res.get_module_config_response.which_payload_variant = meshtastic_ModuleConfig_store_forward_tag;
             res.get_module_config_response.payload_variant.store_forward = moduleConfig.store_forward;
-#else
-            LOG_DEBUG("Store & Forward module excluded from build, skipping config");
-#endif
             break;
         case meshtastic_AdminMessage_ModuleConfigType_RANGETEST_CONFIG:
-#if !MESHTASTIC_EXCLUDE_RANGETEST
             LOG_INFO("Get module config: Range Test");
             res.get_module_config_response.which_payload_variant = meshtastic_ModuleConfig_range_test_tag;
             res.get_module_config_response.payload_variant.range_test = moduleConfig.range_test;
-#else
-            LOG_DEBUG("Range Test module excluded from build, skipping config");
-            // Don't set payload variant - will result in empty response
-#endif
             break;
         case meshtastic_AdminMessage_ModuleConfigType_TELEMETRY_CONFIG:
             LOG_INFO("Get module config: Telemetry");
@@ -1078,13 +1116,9 @@ void AdminModule::handleGetModuleConfig(const meshtastic_MeshPacket &req, const 
             res.get_module_config_response.payload_variant.canned_message = moduleConfig.canned_message;
             break;
         case meshtastic_AdminMessage_ModuleConfigType_AUDIO_CONFIG:
-#if !MESHTASTIC_EXCLUDE_AUDIO
             LOG_INFO("Get module config: Audio");
             res.get_module_config_response.which_payload_variant = meshtastic_ModuleConfig_audio_tag;
             res.get_module_config_response.payload_variant.audio = moduleConfig.audio;
-#else
-            LOG_DEBUG("Audio module excluded from build, skipping config");
-#endif
             break;
         case meshtastic_AdminMessage_ModuleConfigType_REMOTEHARDWARE_CONFIG:
             LOG_INFO("Get module config: Remote Hardware");
@@ -1097,31 +1131,19 @@ void AdminModule::handleGetModuleConfig(const meshtastic_MeshPacket &req, const 
             res.get_module_config_response.payload_variant.neighbor_info = moduleConfig.neighbor_info;
             break;
         case meshtastic_AdminMessage_ModuleConfigType_DETECTIONSENSOR_CONFIG:
-#if !(NO_EXT_GPIO || MESHTASTIC_EXCLUDE_DETECTIONSENSOR)
             LOG_INFO("Get module config: Detection Sensor");
             res.get_module_config_response.which_payload_variant = meshtastic_ModuleConfig_detection_sensor_tag;
             res.get_module_config_response.payload_variant.detection_sensor = moduleConfig.detection_sensor;
-#else
-            LOG_DEBUG("Detection Sensor module excluded from build, skipping config");
-#endif
             break;
         case meshtastic_AdminMessage_ModuleConfigType_AMBIENTLIGHTING_CONFIG:
-#if !MESHTASTIC_EXCLUDE_AMBIENTLIGHTING
             LOG_INFO("Get module config: Ambient Lighting");
             res.get_module_config_response.which_payload_variant = meshtastic_ModuleConfig_ambient_lighting_tag;
             res.get_module_config_response.payload_variant.ambient_lighting = moduleConfig.ambient_lighting;
-#else
-            LOG_DEBUG("Ambient Lighting module excluded from build, skipping config");
-#endif
             break;
         case meshtastic_AdminMessage_ModuleConfigType_PAXCOUNTER_CONFIG:
-#if !MESHTASTIC_EXCLUDE_PAXCOUNTER
             LOG_INFO("Get module config: Paxcounter");
             res.get_module_config_response.which_payload_variant = meshtastic_ModuleConfig_paxcounter_tag;
             res.get_module_config_response.payload_variant.paxcounter = moduleConfig.paxcounter;
-#else
-            LOG_DEBUG("Paxcounter module excluded from build, skipping config");
-#endif
             break;
         }
 

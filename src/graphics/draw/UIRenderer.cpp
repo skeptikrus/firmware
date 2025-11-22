@@ -11,6 +11,7 @@
 #include "graphics/Screen.h"
 #include "graphics/ScreenFonts.h"
 #include "graphics/SharedUIDisplay.h"
+#include "graphics/TimeFormatters.h"
 #include "graphics/images.h"
 #include "main.h"
 #include "target_specific.h"
@@ -20,7 +21,9 @@
 
 // External variables
 extern graphics::Screen *screen;
-
+#if defined(M5STACK_UNITC6L)
+static uint32_t lastSwitchTime = 0;
+#endif
 namespace graphics
 {
 NodeNum UIRenderer::currentFavoriteNodeNum = 0;
@@ -119,38 +122,42 @@ void UIRenderer::drawGpsAltitude(OLEDDisplay *display, int16_t x, int16_t y, con
 void UIRenderer::drawGpsCoordinates(OLEDDisplay *display, int16_t x, int16_t y, const meshtastic::GPSStatus *gps,
                                     const char *mode)
 {
-    auto gpsFormat = config.display.gps_format;
+    auto gpsFormat = uiconfig.gps_format;
     char displayLine[32];
 
     if (!gps->getIsConnected() && !config.position.fixed_position) {
-        strcpy(displayLine, "No GPS present");
-        display->drawString(x, y, displayLine);
+        if (strcmp(mode, "line1") == 0) {
+            strcpy(displayLine, "No GPS present");
+            display->drawString(x, y, displayLine);
+        }
     } else if (!gps->getHasLock() && !config.position.fixed_position) {
-        strcpy(displayLine, "No GPS Lock");
-        display->drawString(x, y, displayLine);
+        if (strcmp(mode, "line1") == 0) {
+            strcpy(displayLine, "No GPS Lock");
+            display->drawString(x, y, displayLine);
+        }
     } else {
 
         geoCoord.updateCoords(int32_t(gps->getLatitude()), int32_t(gps->getLongitude()), int32_t(gps->getAltitude()));
 
-        if (gpsFormat != meshtastic_Config_DisplayConfig_GpsCoordinateFormat_DMS) {
+        if (gpsFormat != meshtastic_DeviceUIConfig_GpsCoordinateFormat_DMS) {
             char coordinateLine_1[22];
             char coordinateLine_2[22];
-            if (gpsFormat == meshtastic_Config_DisplayConfig_GpsCoordinateFormat_DEC) { // Decimal Degrees
+            if (gpsFormat == meshtastic_DeviceUIConfig_GpsCoordinateFormat_DEC) { // Decimal Degrees
                 snprintf(coordinateLine_1, sizeof(coordinateLine_1), "Lat: %f", geoCoord.getLatitude() * 1e-7);
                 snprintf(coordinateLine_2, sizeof(coordinateLine_2), "Lon: %f", geoCoord.getLongitude() * 1e-7);
-            } else if (gpsFormat == meshtastic_Config_DisplayConfig_GpsCoordinateFormat_UTM) { // Universal Transverse Mercator
+            } else if (gpsFormat == meshtastic_DeviceUIConfig_GpsCoordinateFormat_UTM) { // Universal Transverse Mercator
                 snprintf(coordinateLine_1, sizeof(coordinateLine_1), "%2i%1c %06u E", geoCoord.getUTMZone(),
                          geoCoord.getUTMBand(), geoCoord.getUTMEasting());
                 snprintf(coordinateLine_2, sizeof(coordinateLine_2), "%07u N", geoCoord.getUTMNorthing());
-            } else if (gpsFormat == meshtastic_Config_DisplayConfig_GpsCoordinateFormat_MGRS) { // Military Grid Reference System
+            } else if (gpsFormat == meshtastic_DeviceUIConfig_GpsCoordinateFormat_MGRS) { // Military Grid Reference System
                 snprintf(coordinateLine_1, sizeof(coordinateLine_1), "%2i%1c %1c%1c", geoCoord.getMGRSZone(),
                          geoCoord.getMGRSBand(), geoCoord.getMGRSEast100k(), geoCoord.getMGRSNorth100k());
                 snprintf(coordinateLine_2, sizeof(coordinateLine_2), "%05u E %05u N", geoCoord.getMGRSEasting(),
                          geoCoord.getMGRSNorthing());
-            } else if (gpsFormat == meshtastic_Config_DisplayConfig_GpsCoordinateFormat_OLC) { // Open Location Code
+            } else if (gpsFormat == meshtastic_DeviceUIConfig_GpsCoordinateFormat_OLC) { // Open Location Code
                 geoCoord.getOLCCode(coordinateLine_1);
                 coordinateLine_2[0] = '\0';
-            } else if (gpsFormat == meshtastic_Config_DisplayConfig_GpsCoordinateFormat_OSGR) { // Ordnance Survey Grid Reference
+            } else if (gpsFormat == meshtastic_DeviceUIConfig_GpsCoordinateFormat_OSGR) { // Ordnance Survey Grid Reference
                 if (geoCoord.getOSGRE100k() == 'I' || geoCoord.getOSGRN100k() == 'I') { // OSGR is only valid around the UK region
                     snprintf(coordinateLine_1, sizeof(coordinateLine_1), "%s", "Out of Boundary");
                     coordinateLine_2[0] = '\0';
@@ -160,6 +167,48 @@ void UIRenderer::drawGpsCoordinates(OLEDDisplay *display, int16_t x, int16_t y, 
                     snprintf(coordinateLine_2, sizeof(coordinateLine_2), "%05u E %05u N", geoCoord.getOSGREasting(),
                              geoCoord.getOSGRNorthing());
                 }
+            } else if (gpsFormat == meshtastic_DeviceUIConfig_GpsCoordinateFormat_MLS) { // Maidenhead Locator System
+                double lat = geoCoord.getLatitude() * 1e-7;
+                double lon = geoCoord.getLongitude() * 1e-7;
+
+                // Normalize
+                if (lat > 90.0)
+                    lat = 90.0;
+                if (lat < -90.0)
+                    lat = -90.0;
+                while (lon < -180.0)
+                    lon += 360.0;
+                while (lon >= 180.0)
+                    lon -= 360.0;
+
+                double adjLon = lon + 180.0;
+                double adjLat = lat + 90.0;
+
+                char maiden[10]; // enough for 8-char + null
+
+                // Field (2 letters)
+                int lonField = int(adjLon / 20.0);
+                int latField = int(adjLat / 10.0);
+                adjLon -= lonField * 20.0;
+                adjLat -= latField * 10.0;
+
+                // Square (2 digits)
+                int lonSquare = int(adjLon / 2.0);
+                int latSquare = int(adjLat / 1.0);
+                adjLon -= lonSquare * 2.0;
+                adjLat -= latSquare * 1.0;
+
+                // Subsquare (2 letters)
+                double lonUnit = 2.0 / 24.0;
+                double latUnit = 1.0 / 24.0;
+                int lonSub = int(adjLon / lonUnit);
+                int latSub = int(adjLat / latUnit);
+
+                snprintf(maiden, sizeof(maiden), "%c%c%c%c%c%c", 'A' + lonField, 'A' + latField, '0' + lonSquare, '0' + latSquare,
+                         'A' + lonSub, 'A' + latSub);
+
+                snprintf(coordinateLine_1, sizeof(coordinateLine_1), "MH: %s", maiden);
+                coordinateLine_2[0] = '\0'; // only need one line
             }
 
             if (strcmp(mode, "line1") == 0) {
@@ -232,7 +281,6 @@ void UIRenderer::drawNodes(OLEDDisplay *display, int16_t x, int16_t y, const mes
 // **********************
 void UIRenderer::drawNodeInfo(OLEDDisplay *display, const OLEDDisplayUiState *state, int16_t x, int16_t y)
 {
-
     if (favoritedNodes.empty())
         return;
 
@@ -244,8 +292,15 @@ void UIRenderer::drawNodeInfo(OLEDDisplay *display, const OLEDDisplayUiState *st
     meshtastic_NodeInfoLite *node = favoritedNodes[nodeIndex];
     if (!node || node->num == nodeDB->getNodeNum() || !node->is_favorite)
         return;
-
     display->clear();
+#if defined(M5STACK_UNITC6L)
+    uint32_t now = millis();
+    if (now - lastSwitchTime >= 10000) // 10000 ms = 10 秒
+    {
+        display->display();
+        lastSwitchTime = now;
+    }
+#endif
     currentFavoriteNodeNum = node->num;
     // === Create the shortName and title string ===
     const char *shortName = (node->has_user && haveGlyphs(node->user.short_name)) ? node->user.short_name : "Node";
@@ -264,9 +319,13 @@ void UIRenderer::drawNodeInfo(OLEDDisplay *display, const OLEDDisplayUiState *st
     // List of available macro Y positions in order, from top to bottom.
     int line = 1; // which slot to use next
     std::string usernameStr;
-
     // === 1. Long Name (always try to show first) ===
+#if defined(M5STACK_UNITC6L)
+    const char *username = (node->has_user && node->user.long_name[0]) ? node->user.short_name : nullptr;
+#else
     const char *username = (node->has_user && node->user.long_name[0]) ? node->user.long_name : nullptr;
+#endif
+
     if (username) {
         usernameStr = sanitizeString(username); // Sanitize the incoming long_name just in case
         // Print node's long name (e.g. "Backpack Node")
@@ -321,21 +380,11 @@ void UIRenderer::drawNodeInfo(OLEDDisplay *display, const OLEDDisplayUiState *st
     if (seenStr[0] && line < 5) {
         display->drawString(x, getTextPositions(display)[line++], seenStr);
     }
-
+#if !defined(M5STACK_UNITC6L)
     // === 4. Uptime (only show if metric is present) ===
     char uptimeStr[32] = "";
     if (node->has_device_metrics && node->device_metrics.has_uptime_seconds) {
-        uint32_t uptime = node->device_metrics.uptime_seconds;
-        uint32_t days = uptime / 86400;
-        uint32_t hours = (uptime % 86400) / 3600;
-        uint32_t mins = (uptime % 3600) / 60;
-        // Show as "Up: 2d 3h", "Up: 5h 14m", or "Up: 37m"
-        if (days)
-            snprintf(uptimeStr, sizeof(uptimeStr), " Uptime: %ud %uh", days, hours);
-        else if (hours)
-            snprintf(uptimeStr, sizeof(uptimeStr), " Uptime: %uh %um", hours, mins);
-        else
-            snprintf(uptimeStr, sizeof(uptimeStr), " Uptime: %um", mins);
+        getUptimeStr(node->device_metrics.uptime_seconds * 1000, " Up", uptimeStr, sizeof(uptimeStr));
     }
     if (uptimeStr[0] && line < 5) {
         display->drawString(x, getTextPositions(display)[line++], uptimeStr);
@@ -493,6 +542,8 @@ void UIRenderer::drawNodeInfo(OLEDDisplay *display, const OLEDDisplayUiState *st
         }
         // else show nothing
     }
+#endif
+    graphics::drawCommonFooter(display, x, y);
 }
 
 // ****************************
@@ -504,9 +555,14 @@ void UIRenderer::drawDeviceFocused(OLEDDisplay *display, OLEDDisplayUiState *sta
     display->setTextAlignment(TEXT_ALIGN_LEFT);
     display->setFont(FONT_SMALL);
     int line = 1;
+    meshtastic_NodeInfoLite *ourNode = nodeDB->getMeshNode(nodeDB->getNodeNum());
 
     // === Header ===
+#if defined(M5STACK_UNITC6L)
+    graphics::drawCommonHeader(display, x, y, "Home");
+#else
     graphics::drawCommonHeader(display, x, y, "");
+#endif
 
     // === Content below header ===
 
@@ -521,20 +577,15 @@ void UIRenderer::drawDeviceFocused(OLEDDisplay *display, OLEDDisplayUiState *sta
     config.display.heading_bold = false;
 
     // Display Region and Channel Utilization
+#if defined(M5STACK_UNITC6L)
+    drawNodes(display, x, getTextPositions(display)[line] + 2, nodeStatus, -1, false, "online");
+#else
     drawNodes(display, x + 1, getTextPositions(display)[line] + 2, nodeStatus, -1, false, "online");
-
+#endif
     char uptimeStr[32] = "";
-    uint32_t uptime = millis() / 1000;
-    uint32_t days = uptime / 86400;
-    uint32_t hours = (uptime % 86400) / 3600;
-    uint32_t mins = (uptime % 3600) / 60;
-    // Show as "Up: 2d 3h", "Up: 5h 14m", or "Up: 37m"
-    if (days)
-        snprintf(uptimeStr, sizeof(uptimeStr), "Up: %ud %uh", days, hours);
-    else if (hours)
-        snprintf(uptimeStr, sizeof(uptimeStr), "Up: %uh %um", hours, mins);
-    else
-        snprintf(uptimeStr, sizeof(uptimeStr), "Up: %um", mins);
+#if !defined(M5STACK_UNITC6L)
+    getUptimeStr(millis(), "Up", uptimeStr, sizeof(uptimeStr));
+#endif
     display->drawString(SCREEN_WIDTH - display->getStringWidth(uptimeStr), getTextPositions(display)[line++], uptimeStr);
 
     // === Second Row: Satellites and Voltage ===
@@ -563,6 +614,21 @@ void UIRenderer::drawDeviceFocused(OLEDDisplay *display, OLEDDisplayUiState *sta
     }
 #endif
 
+#if defined(M5STACK_UNITC6L)
+    line += 1;
+
+    // === Node Identity ===
+    int textWidth = 0;
+    int nameX = 0;
+    char shortnameble[35];
+    snprintf(shortnameble, sizeof(shortnameble), "%s",
+             graphics::UIRenderer::haveGlyphs(owner.short_name) ? owner.short_name : "");
+
+    // === ShortName Centered ===
+    textWidth = display->getStringWidth(shortnameble);
+    nameX = (SCREEN_WIDTH - textWidth) / 2;
+    display->drawString(nameX, getTextPositions(display)[line++], shortnameble);
+#else
     if (powerStatus->getHasBattery()) {
         char batStr[20];
         int batV = powerStatus->getBatteryVoltageMv() / 1000;
@@ -655,10 +721,8 @@ void UIRenderer::drawDeviceFocused(OLEDDisplay *display, OLEDDisplayUiState *sta
     int textWidth = 0;
     int nameX = 0;
     int yOffset = (isHighResolution) ? 0 : 5;
-    const char *longName = nullptr;
     std::string longNameStr;
 
-    meshtastic_NodeInfoLite *ourNode = nodeDB->getMeshNode(nodeDB->getNodeNum());
     if (ourNode && ourNode->has_user && strlen(ourNode->user.long_name) > 0) {
         longNameStr = sanitizeString(ourNode->user.long_name);
     }
@@ -688,6 +752,8 @@ void UIRenderer::drawDeviceFocused(OLEDDisplay *display, OLEDDisplayUiState *sta
         nameX = (SCREEN_WIDTH - textWidth) / 2;
         display->drawString(nameX, getTextPositions(display)[line++], shortnameble);
     }
+#endif
+    graphics::drawCommonFooter(display, x, y);
 }
 
 // Start Functions to write date/time to the screen
@@ -846,6 +912,28 @@ void UIRenderer::drawIconScreen(const char *upperMsg, OLEDDisplay *display, OLED
     // needs to be drawn relative to x and y
 
     // draw centered icon left to right and centered above the one line of app text
+#if defined(M5STACK_UNITC6L)
+    display->drawXbm(x + (SCREEN_WIDTH - 50) / 2, y + (SCREEN_HEIGHT - 28) / 2, icon_width, icon_height, icon_bits);
+    display->setFont(FONT_MEDIUM);
+    display->setTextAlignment(TEXT_ALIGN_LEFT);
+    display->setFont(FONT_SMALL);
+    // Draw region in upper left
+    if (upperMsg) {
+        int msgWidth = display->getStringWidth(upperMsg);
+        int msgX = x + (SCREEN_WIDTH - msgWidth) / 2;
+        int msgY = y;
+        display->drawString(msgX, msgY, upperMsg);
+    }
+    // Draw version and short name in bottom middle
+    char buf[25];
+    snprintf(buf, sizeof(buf), "%s   %s", xstr(APP_VERSION_SHORT),
+             graphics::UIRenderer::haveGlyphs(owner.short_name) ? owner.short_name : "");
+
+    display->drawString(x + getStringCenteredX(buf), y + SCREEN_HEIGHT - FONT_HEIGHT_MEDIUM, buf);
+    screen->forceDisplay();
+
+    display->setTextAlignment(TEXT_ALIGN_LEFT); // Restore left align, just to be kind to any other unsuspecting code
+#else
     display->drawXbm(x + (SCREEN_WIDTH - icon_width) / 2, y + (SCREEN_HEIGHT - FONT_HEIGHT_MEDIUM - icon_height) / 2 + 2,
                      icon_width, icon_height, icon_bits);
 
@@ -854,7 +942,6 @@ void UIRenderer::drawIconScreen(const char *upperMsg, OLEDDisplay *display, OLED
     const char *title = "meshtastic.org";
     display->drawString(x + getStringCenteredX(title), y + SCREEN_HEIGHT - FONT_HEIGHT_MEDIUM, title);
     display->setFont(FONT_SMALL);
-
     // Draw region in upper left
     if (upperMsg)
         display->drawString(x + 0, y + 0, upperMsg);
@@ -869,6 +956,7 @@ void UIRenderer::drawIconScreen(const char *upperMsg, OLEDDisplay *display, OLED
     screen->forceDisplay();
 
     display->setTextAlignment(TEXT_ALIGN_LEFT); // Restore left align, just to be kind to any other unsuspecting code
+#endif
 }
 
 // ****************************
@@ -895,24 +983,7 @@ void UIRenderer::drawCompassAndLocationScreen(OLEDDisplay *display, OLEDDisplayU
     const char *displayLine = ""; // Initialize to empty string by default
     meshtastic_NodeInfoLite *ourNode = nodeDB->getMeshNode(nodeDB->getNodeNum());
 
-    bool usePhoneGPS = (ourNode && nodeDB->hasValidPosition(ourNode) &&
-                        config.position.gps_mode != meshtastic_Config_PositionConfig_GpsMode_ENABLED);
-
-    if (usePhoneGPS) {
-        // Phone-provided GPS is active
-        displayLine = "Phone GPS";
-        int yOffset = (isHighResolution) ? 3 : 1;
-        if (isHighResolution) {
-            NodeListRenderer::drawScaledXBitmap16x16(x, getTextPositions(display)[line] + yOffset - 5, imgSatellite_width,
-                                                     imgSatellite_height, imgSatellite, display);
-        } else {
-            display->drawXbm(x + 1, getTextPositions(display)[line] + yOffset, imgSatellite_width, imgSatellite_height,
-                             imgSatellite);
-        }
-        int xOffset = (isHighResolution) ? 6 : 0;
-        display->drawString(x + 11 + xOffset, getTextPositions(display)[line++], displayLine);
-    } else if (config.position.gps_mode != meshtastic_Config_PositionConfig_GpsMode_ENABLED) {
-        // GPS disabled / not present
+    if (config.position.gps_mode != meshtastic_Config_PositionConfig_GpsMode_ENABLED) {
         if (config.position.fixed_position) {
             displayLine = "Fixed GPS";
         } else {
@@ -958,36 +1029,17 @@ void UIRenderer::drawCompassAndLocationScreen(OLEDDisplay *display, OLEDDisplayU
     if (strcmp(displayLine, "GPS off") != 0 && strcmp(displayLine, "No GPS") != 0) {
         // === Second Row: Last GPS Fix ===
         if (gpsStatus->getLastFixMillis() > 0) {
-            uint32_t delta = (millis() - gpsStatus->getLastFixMillis()) / 1000; // seconds since last fix
-            uint32_t days = delta / 86400;
-            uint32_t hours = (delta % 86400) / 3600;
-            uint32_t mins = (delta % 3600) / 60;
-            uint32_t secs = delta % 60;
-
-            char buf[32];
+            uint32_t delta = millis() - gpsStatus->getLastFixMillis();
+            char uptimeStr[32];
 #if defined(USE_EINK)
             // E-Ink: skip seconds, show only days/hours/mins
-            if (days > 0) {
-                snprintf(buf, sizeof(buf), " Last: %ud %uh", days, hours);
-            } else if (hours > 0) {
-                snprintf(buf, sizeof(buf), " Last: %uh %um", hours, mins);
-            } else {
-                snprintf(buf, sizeof(buf), " Last: %um", mins);
-            }
+            getUptimeStr(delta, "Last", uptimeStr, sizeof(uptimeStr), false);
 #else
             // Non E-Ink: include seconds where useful
-            if (days > 0) {
-                snprintf(buf, sizeof(buf), "Last: %ud %uh", days, hours);
-            } else if (hours > 0) {
-                snprintf(buf, sizeof(buf), "Last: %uh %um", hours, mins);
-            } else if (mins > 0) {
-                snprintf(buf, sizeof(buf), "Last: %um %us", mins, secs);
-            } else {
-                snprintf(buf, sizeof(buf), "Last: %us", secs);
-            }
+            getUptimeStr(delta, "Last", uptimeStr, sizeof(uptimeStr), true);
 #endif
 
-            display->drawString(0, getTextPositions(display)[line++], buf);
+            display->drawString(0, getTextPositions(display)[line++], uptimeStr);
         } else {
             display->drawString(0, getTextPositions(display)[line++], "Last: ?");
         }
@@ -995,24 +1047,23 @@ void UIRenderer::drawCompassAndLocationScreen(OLEDDisplay *display, OLEDDisplayU
         // === Third Row: Line 1 GPS Info ===
         UIRenderer::drawGpsCoordinates(display, x, getTextPositions(display)[line++], gpsStatus, "line1");
 
-        if (config.display.gps_format != meshtastic_Config_DisplayConfig_GpsCoordinateFormat_OLC) {
+        if (uiconfig.gps_format != meshtastic_DeviceUIConfig_GpsCoordinateFormat_OLC &&
+            uiconfig.gps_format != meshtastic_DeviceUIConfig_GpsCoordinateFormat_MLS) {
             // === Fourth Row: Line 2 GPS Info ===
             UIRenderer::drawGpsCoordinates(display, x, getTextPositions(display)[line++], gpsStatus, "line2");
         }
 
-        // === Fourth/Fifth Row: Altitude ===
-        char DisplayLineTwo[32] = {0};
-        int32_t alt = (strcmp(displayLine, "Phone GPS") == 0 && ourNode && nodeDB->hasValidPosition(ourNode))
-                          ? ourNode->position.altitude
-                          : geoCoord.getAltitude();
+        // === Final Row: Altitude ===
+        char altitudeLine[32] = {0};
+        int32_t alt = geoCoord.getAltitude();
         if (config.display.units == meshtastic_Config_DisplayConfig_DisplayUnits_IMPERIAL) {
-            snprintf(DisplayLineTwo, sizeof(DisplayLineTwo), "Alt: %.0fft", geoCoord.getAltitude() * METERS_TO_FEET);
+            snprintf(altitudeLine, sizeof(altitudeLine), "Alt: %.0fft", alt * METERS_TO_FEET);
         } else {
-            snprintf(DisplayLineTwo, sizeof(DisplayLineTwo), "Alt: %.0im", geoCoord.getAltitude());
+            snprintf(altitudeLine, sizeof(altitudeLine), "Alt: %.0im", alt);
         }
-        display->drawString(x, getTextPositions(display)[line++], DisplayLineTwo);
+        display->drawString(x, getTextPositions(display)[line++], altitudeLine);
     }
-
+#if !defined(M5STACK_UNITC6L)
     // === Draw Compass if heading is valid ===
     if (validHeading) {
         // --- Compass Rendering: landscape (wide) screens use original side-aligned logic ---
@@ -1095,6 +1146,8 @@ void UIRenderer::drawCompassAndLocationScreen(OLEDDisplay *display, OLEDDisplayU
         }
     }
 #endif
+#endif // HAS_GPS
+    graphics::drawCommonFooter(display, x, y);
 }
 
 #ifdef USERPREFS_OEM_TEXT
@@ -1179,7 +1232,13 @@ void UIRenderer::drawNavigationBar(OLEDDisplay *display, OLEDDisplayUiState *sta
     if (totalIcons == 0)
         return;
 
-    const size_t iconsPerPage = (SCREEN_WIDTH + spacing) / (iconSize + spacing);
+    const int navPadding = isHighResolution ? 24 : 12; // padding per side
+
+    int usableWidth = SCREEN_WIDTH - (navPadding * 2);
+    if (usableWidth < iconSize)
+        usableWidth = iconSize;
+
+    const size_t iconsPerPage = usableWidth / (iconSize + spacing);
     const size_t currentPage = currentFrame / iconsPerPage;
     const size_t pageStart = currentPage * iconsPerPage;
     const size_t pageEnd = min(pageStart + iconsPerPage, totalIcons);
@@ -1187,14 +1246,13 @@ void UIRenderer::drawNavigationBar(OLEDDisplay *display, OLEDDisplayUiState *sta
     const int totalWidth = (pageEnd - pageStart) * iconSize + (pageEnd - pageStart - 1) * spacing;
     const int xStart = (SCREEN_WIDTH - totalWidth) / 2;
 
-    // Only show bar briefly after switching frames
-    static uint32_t navBarLastShown = 0;
-    static bool cosmeticRefreshDone = false;
-
     bool navBarVisible = millis() - lastFrameChangeTime <= ICON_DISPLAY_DURATION_MS;
     int y = navBarVisible ? (SCREEN_HEIGHT - iconSize - 1) : SCREEN_HEIGHT;
 
 #if defined(USE_EINK)
+    // Only show bar briefly after switching frames
+    static uint32_t navBarLastShown = 0;
+    static bool cosmeticRefreshDone = false;
     static bool navBarPrevVisible = false;
 
     if (navBarVisible && !navBarPrevVisible) {
@@ -1250,6 +1308,46 @@ void UIRenderer::drawNavigationBar(OLEDDisplay *display, OLEDDisplayUiState *sta
         if (isActive) {
             display->setColor(WHITE);
         }
+    }
+
+    // Compact arrow drawer
+    auto drawArrow = [&](bool rightSide) {
+        display->setColor(WHITE);
+
+        const int offset = isHighResolution ? 3 : 1;
+        const int halfH = rectHeight / 2;
+
+        const int top = (y - 2) + (rectHeight - halfH) / 2;
+        const int bottom = top + halfH - 1;
+        const int midY = top + (halfH / 2);
+
+        const int maxW = 4;
+
+        // Determine left X coordinate
+        int baseX = rightSide ? (rectX + rectWidth + offset) : // right arrow
+                        (rectX - offset - 1);                  // left arrow
+
+        for (int yy = top; yy <= bottom; yy++) {
+            int dist = abs(yy - midY);
+            int lineW = maxW - (dist * maxW / (halfH / 2));
+            if (lineW < 1)
+                lineW = 1;
+
+            if (rightSide) {
+                display->drawHorizontalLine(baseX, yy, lineW);
+            } else {
+                display->drawHorizontalLine(baseX - lineW + 1, yy, lineW);
+            }
+        }
+    };
+    // Right arrow
+    if (pageEnd < totalIcons) {
+        drawArrow(true);
+    }
+
+    // Left arrow
+    if (pageStart > 0) {
+        drawArrow(false);
     }
 
     // Knock the corners off the square
